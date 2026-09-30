@@ -41,7 +41,7 @@ jobs:
         run: npm run build
 
       - name: Add Android platform
-        run: npx cap add android
+        run: npm install --no-save typescript && npx cap add android
 
       - name: Sync Capacitor plugins
         run: npx cap sync android
