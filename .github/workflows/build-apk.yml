@@ -1,0 +1,85 @@
+name: Build Sony time APK
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Install web dependencies
+        run: npm install
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Sync Capacitor plugins
+        run: npx cap sync android
+
+      - name: Remove unused INTERNET permission and restrict file sharing
+        run: |
+          python - <<'PY2'
+          from pathlib import Path
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          text = manifest.read_text()
+          text = text.replace('    <uses-permission android:name="android.permission.INTERNET" />\n', '')
+          text = text.replace('<uses-permission android:name="android.permission.INTERNET" />', '')
+          manifest.write_text(text)
+          fp = Path('android/app/src/main/res/xml/file_paths.xml')
+          fp.parent.mkdir(parents=True, exist_ok=True)
+          fp.write_text('''<paths xmlns:android="http://schemas.android.com/apk/res/android">\n    <external-path name="sonytime_exports" path="Documents/SonyTime/exports/" />\n</paths>\n''')
+          PY2
+          if grep -R 'android.permission.INTERNET' android/app/src/main/AndroidManifest.xml; then exit 1; fi
+
+      - name: Setup Gradle 8.14.3
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Build debug APK
+        working-directory: android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Verify merged manifest has no INTERNET permission
+        run: |
+          if grep -R 'android.permission.INTERNET' android/app/build/intermediates/merged_manifest/debug/processDebugManifest/AndroidManifest.xml; then
+            echo 'INTERNET permission is still present in merged manifest'
+            exit 1
+          fi
+          test -f android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sony-time-v1.1-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
