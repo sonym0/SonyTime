@@ -1,5 +1,6 @@
 node_modules/
 dist/
 android/
+/public/assets/fonts/
 .DS_Store
 *.log

@@ -10,18 +10,21 @@ Stack: Capacitor 8.5.2 + Filesystem 8.1.3 + Share 8.0.2 + SheetJS 0.18.5 + Cairo
 - Cairo موجود كاعتماد محلي ويتم نسخه إلى `public/assets/fonts` أثناء build.
 - البيانات في `Documents/SonyTime/data.json` عبر Capacitor Filesystem على Android.
 - حفظ تلقائي بعد الحضور والانصراف والحذف ومسح الشهر.
-- نسخة احتياطية يومية عند أول فتح للتطبيق في ذلك اليوم داخل `Documents/SonyTime/backup/`.
-- زر استرجاع أحدث نسخة احتياطية.
+- نسخة يومية تتحقق من سلامتها ولا تستبدل نسخة سابقة سليمة؛ تُحفظ نسخ أمان قبل كل كتابة للسجل.
+- التحقق من بنية سجل الحضور والنسخ الاحتياطية قبل الحفظ أو الاستعادة؛ فشل القراءة/JSON التالف لا يتحول إلى سجل فارغ.
+- تصدير نسخة JSON عبر قائمة مشاركة Android لاختيار Files/Drive أو تنزيلها في المتصفح، واستيرادها عبر منتقي الملفات مع تأكيد قبل الاستبدال.
+- الملف التالف الأصلي يُحفظ في `Documents/SonyTime/recovery/` قبل الاستعادة؛ لا يتم استبداله بصمت.
 - ملفات Excel داخل `Documents/SonyTime/exports/` مع زر مشاركة آخر ملف.
 - RTL وتصميم Sony time الأصلي محفوظ.
 
-## بناء APK بدون Android Studio
-1. ارفع المشروع إلى GitHub.
-2. افتح تبويب **Actions**.
-3. شغّل workflow باسم **Build Sony time APK** أو اعمل Push جديد.
-4. بعد نجاح الـ workflow افتح الـ Run.
-5. من **Artifacts** نزّل `sony-time-v1.1-debug-apk`.
-6. فك الضغط وثبّت `app-debug.apk` على الهاتف.
+## بناء APK اختباري بدون Android Studio
+1. يلزم وجود commit وفرع التطوير على GitHub؛ التعديلات المحلية غير المرفوعة لا تصل إلى Actions.
+2. افتح **Actions → Build Sony time APK → Run workflow** واختر فرع التطوير، أو استخدم البناء التلقائي عند Push.
+3. بعد نجاح الـ workflow نزّل Artifact باسم `sony-time-test-v1.1-debug-apk`.
+4. هذا APK اختباري موقّع بتوقيع Debug فقط، ولا ينشئ Release أو يستخدم مفتاح التوقيع الإنتاجي.
+5. معرّف الاختبار `com.sonytime.app.test`؛ لا تثبّته فوق النسخة الأساسية، وافحص المعرّف والتوقيع قبل التثبيت.
+
+علامة الاختبار في الـworkflow تغيّر أيضًا مساحة التخزين إلى `Documents/SonyTimeTest/` و`Cache/SonyTimeTest/`. البناء العادي يظل على `com.sonytime.app` ومسارات `SonyTime/` الأصلية.
 
 > ملاحظة: النسخة الاحتياطية اليومية تُنشأ تلقائيًا عند أول تشغيل للتطبيق في كل يوم. تشغيل JS في الخلفية 24/7 ليس مضمونًا على Android، لذلك لم أدّعِ جدولة خلفية لم تُختبر.
 

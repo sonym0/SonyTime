@@ -99,10 +99,15 @@ body{font-family:CairoLocal,Cairo,system-ui,sans-serif}
 <button class="act" id="clr">مسح الشهر</button>
 </div>
 <div class="row3">
-<button class="act" id="restore">استرجاع من نسخة احتياطية</button>
+<button class="act" id="restore">استرجاع أحدث نسخة سليمة</button>
 <button class="act" id="share" disabled>مشاركة آخر Excel</button>
 </div>
-<div class="statusline" id="storageStatus">تخزين محلي آمن — بدون إنترنت</div>
+<div class="row3">
+<button class="act x" id="exportBackup" disabled>تصدير نسخة JSON</button>
+<button class="act" id="importBackup" disabled>استيراد نسخة احتياطية</button>
+</div>
+<input id="backupFile" type="file" accept=".json,application/json" hidden>
+<div class="statusline" id="storageStatus">جارٍ التحقق من بيانات الحضور…</div>
 
 <div id="log"></div>
 </div>
@@ -112,7 +117,7 @@ body{font-family:CairoLocal,Cairo,system-ui,sans-serif}
 <div class="modal" id="restoreModal" role="dialog" aria-modal="true" aria-labelledby="restoreTitle">
   <div class="sheet">
     <h3 id="restoreTitle">استرجاع نسخة احتياطية</h3>
-    <p>سيتم اختيار أحدث نسخة احتياطية محفوظة في Documents/SonyTime/backup/ واستبدال السجل الحالي بها.</p>
+    <p>سيتم اختيار أحدث نسخة JSON سليمة من النسخ المحلية، وحفظ نسخة أمان من السجل الحالي قبل الاستبدال. ستظهر رسالة تأكيد قبل تطبيق النسخة.</p>
     <div class="row2"><button class="act" id="cancelRestore">إلغاء</button><button class="act x" id="confirmRestore">استرجاع الآن</button></div>
   </div>
 </div>
