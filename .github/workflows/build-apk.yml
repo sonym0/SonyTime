@@ -15,6 +15,7 @@ jobs:
     env:
       SONYTIME_TEST_BUILD: '1'
       VITE_SONYTIME_TEST_BUILD: 'true'
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4

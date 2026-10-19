@@ -55,7 +55,25 @@ test('invalid session records fail schema validation', () => {
 });
 
 test('session records with unexpected properties are rejected', () => {
-  assert.equal(validateSessions([{ id: 100, i: 1000, o: null, note: '<img>' }]).valid, false);
+  assert.equal(validateSessions([{ id: 100, i: 1000, o: null, unknownField: 'اضافة' }]).valid, false);
+});
+
+test('manual record with approved keys is accepted', () => {
+  const manualRecord = {
+    id: 200,
+    i: null,
+    o: null,
+    recordType: 'manual',
+    manualDurationOnly: true,
+    durationMinutes: 450,
+    dateKey: '2026-10-15',
+    note: 'سجل يدوي بالمدة فقط'
+  };
+  assert.equal(validateSessions([manualRecord]).valid, true);
+});
+
+test('auto record with extra note property is rejected', () => {
+  assert.equal(validateSessions([{ id: 100, i: 1000, o: null, note: 'اضافة' }]).valid, false);
 });
 
 test('backup timestamps order newer safety snapshots ahead of older daily copies', () => {

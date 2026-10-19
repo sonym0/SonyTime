@@ -60,22 +60,37 @@ export function validateSessions(value) {
   if (!Array.isArray(value)) return { valid: false, reason: 'expected_array' };
   if (value.length > 100000) return { valid: false, reason: 'too_many_records' };
   const identifiers = new Set();
-  let openSessions = 0;
+  let openAutoSessions = 0;
+  const manualAllowedKeys = new Set(['id', 'i', 'o', 'recordType', 'manualDurationOnly', 'durationMinutes', 'dateKey', 'note']);
+  const autoAllowedKeys = new Set(['id', 'i', 'o']);
   for (let index = 0; index < value.length; index += 1) {
     const item = value[index];
-    const keys = item && typeof item === 'object' ? Object.keys(item) : [];
     if (!item || Object.getPrototypeOf(item) !== Object.prototype ||
-        keys.length !== 3 || !keys.includes('id') || !keys.includes('i') || !keys.includes('o')) {
+        !Number.isSafeInteger(item.id) || item.id < 0) {
       return { valid: false, reason: 'invalid_record', index };
     }
-    if (!Number.isSafeInteger(item.id) || item.id < 0 ||
-        !Number.isSafeInteger(item.i) || item.i < 0 || item.i > 8_640_000_000_000_000 ||
-        !(item.o === null || (Number.isSafeInteger(item.o) && item.o >= item.i && item.o <= 8_640_000_000_000_000))) {
-      return { valid: false, reason: 'invalid_record', index };
+    const itemKeys = new Set(Object.keys(item));
+    const allowedKeys = item.recordType === 'manual' ? manualAllowedKeys : autoAllowedKeys;
+    for (const key of itemKeys) {
+      if (!allowedKeys.has(key)) {
+        return { valid: false, reason: 'unexpected_property', index, property: key };
+      }
     }
     if (identifiers.has(item.id)) return { valid: false, reason: 'duplicate_id', index };
     identifiers.add(item.id);
-    if (item.o === null && ++openSessions > 1) return { valid: false, reason: 'multiple_open_sessions', index };
+    const isManual = item.recordType === 'manual';
+    if (!isManual) {
+      if (!Number.isSafeInteger(item.i) || item.i < 0 || item.i > 8_640_000_000_000_000 ||
+          !(item.o === null || (Number.isSafeInteger(item.o) && item.o >= item.i && item.o <= 8_640_000_000_000_000))) {
+        return { valid: false, reason: 'invalid_record', index };
+      }
+      if (item.o === null && ++openAutoSessions > 1) return { valid: false, reason: 'multiple_open_sessions', index };
+    } else {
+      const hasTimes = Number.isSafeInteger(item.i) && Number.isSafeInteger(item.o);
+      const hasDuration = item.manualDurationOnly && Number.isFinite(item.durationMinutes) && item.durationMinutes > 0;
+      if (!hasTimes && !hasDuration) return { valid: false, reason: 'invalid_record', index };
+      if (hasTimes && item.o <= item.i) return { valid: false, reason: 'invalid_record', index };
+    }
   }
   return { valid: true, data: value };
 }

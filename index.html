@@ -101,6 +101,9 @@ body{font-family:CairoLocal,Cairo,system-ui,sans-serif}
 <button class="act" id="clr">مسح الشهر</button>
 </div>
 <div class="row3">
+<button class="act x" id="manualEntry">إضافة سجل يدوي</button>
+</div>
+<div class="row3">
 <button class="act" id="restore">استرجاع أحدث نسخة سليمة</button>
 <button class="act" id="share" disabled>مشاركة آخر Excel</button>
 </div>
@@ -113,6 +116,53 @@ body{font-family:CairoLocal,Cairo,system-ui,sans-serif}
 <div class="statusline" id="syncStatus" style="font-size:11px;margin-top:4px;">السحابة: غير مضبوط</div>
 <div class="row3">
   <button class="act" id="syncNow" disabled>مزامنة مع السحابة الآن</button>
+</div>
+
+<div class="modal" id="manualEntryModal" role="dialog" aria-modal="true" aria-labelledby="manualEntryTitle">
+  <div class="sheet">
+    <h3 id="manualEntryTitle">إضافة سجل يدوي</h3>
+    <p style="margin:8px 0;">سجل حضور وانصراف ليوم سابق، أو أدخل المدة مباشرة إذا كنت لا تعرف الأوقات.</p>
+    <div style="margin:10px 0;">
+      <label style="display:block;margin-bottom:6px;">التاريخ <span style="color:#ffb3ba;">*</span></label>
+      <input type="date" id="manualDate" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:#070b14;color:var(--tx);">
+    </div>
+    <div style="margin:10px 0;">
+      <label style="display:block;margin-bottom:6px;">نوع الإدخال</label>
+      <select id="manualMode" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:#070b14;color:var(--tx);">
+        <option value="duration">المدة فقط (ساعات ودقائق)</option>
+        <option value="times">وقت الحضور ووقت الانصراف</option>
+      </select>
+    </div>
+    <div id="manualDurationFields" style="margin:10px 0;display:flex;gap:10px;">
+      <div style="flex:1;">
+        <label style="display:block;margin-bottom:6px;">ساعات العمل</label>
+        <input type="number" id="manualHours" min="0" max="24" value="0" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:#070b14;color:var(--tx);">
+      </div>
+      <div style="flex:1;">
+        <label style="display:block;margin-bottom:6px;">دقائق العمل</label>
+        <input type="number" id="manualMinutes" min="0" max="59" value="0" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:#070b14;color:var(--tx);">
+      </div>
+    </div>
+    <div id="manualTimeFields" style="margin:10px 0;display:flex;gap:10px;display:none;">
+      <div style="flex:1;">
+        <label style="display:block;margin-bottom:6px;">وقت الحضور</label>
+        <input type="time" id="manualCheckIn" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:#070b14;color:var(--tx);">
+      </div>
+      <div style="flex:1;">
+        <label style="display:block;margin-bottom:6px;">وقت الانصراف</label>
+        <input type="time" id="manualCheckOut" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:#070b14;color:var(--tx);">
+      </div>
+    </div>
+    <div style="margin:10px 0;">
+      <label style="display:block;margin-bottom:6px;">ملاحظات (اختياري)</label>
+      <input type="text" id="manualNote" placeholder="مثال: حضور متأخر بسبب ازدحام" style="width:100%;padding:8px;border-radius:8px;border:1px solid var(--line);background:#070b14;color:var(--tx);">
+    </div>
+    <div style="margin-top:16px;display:flex;gap:10px;">
+      <button class="act" id="manualCancel">إلغاء</button>
+      <button class="act x" id="manualConfirm">حفظ السجل</button>
+    </div>
+    <div id="manualResult" style="margin-top:8px;font-size:12px;color:#ffb3ba;min-height:16px;"></div>
+  </div>
 </div>
 
 <div id="log"></div>

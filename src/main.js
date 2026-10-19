@@ -40,6 +40,7 @@ let safetySequence = 0;
 let syncStatus = 'idle'; // idle | syncing | synced | error
 let lastSyncAt = null;
 let syncError = null;
+let manualEntryOpen = false; // حالة modal الإدخال اليدوي
 
 const $ = (id) => document.getElementById(id);
 
@@ -52,10 +53,26 @@ function toast(m) {
 function dur(ms) { const m=Math.round(ms/6e4),h=Math.floor(m/60); return h+'س '+(m%60)+'د'; }
 function hrs(ms) { return Math.round(ms/36e5*100)/100; }
 function tm(ms) { return new Date(ms).toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'}); }
-function dk(ms) { const d=new Date(ms); return d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate(); }
-function open_() { return S.find(s=>s.o==null); }
-function len(s) { return (s.o==null?Date.now():s.o)-s.i; }
-function inMonth(s) { const d=new Date(s.i); return d.getFullYear()==cur.getFullYear()&&d.getMonth()==cur.getMonth(); }
+function dk(ms) {
+  if (ms == null) return null;
+  const d=new Date(ms); return d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate();
+}
+function open_() { return S.find(s=>s.o==null && s.recordType==='auto'); }
+function len(s) {
+  // V2: سجل يدوي بالمدة فقط — لا يُحتسب كوردية مفتوحة، ولا تُختلق له أوقات.
+  if (s.recordType==='manual' && s.manualDurationOnly && Number.isFinite(s.durationMinutes)) {
+    return s.durationMinutes * 60 * 1000;
+  }
+  return (s.o==null?Date.now():s.o)-s.i;
+}
+function inMonth(s) {
+  // V2: السجلات اليدوية بالمدة فقط تستخدم dateKey للتجميع الشهري.
+  if (s.recordType==='manual' && s.dateKey) {
+    const d=new Date(s.dateKey+'T00:00:00');
+    return d.getFullYear()==cur.getFullYear()&&d.getMonth()==cur.getMonth();
+  }
+  const d=new Date(s.i); return d.getFullYear()==cur.getFullYear()&&d.getMonth()==cur.getMonth();
+}
 function mine() { return S.filter(inMonth).sort((a,b)=>a.i-b.i); }
 function todayKey() { const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
 
@@ -289,6 +306,107 @@ async function autoSync() {
   await syncToCloud();
 }
 /* ===== End Cloud Sync ===== */
+
+/* ===== Manual history entry (V2) ===== */
+function pad2(n) { return String(n).padStart(2, '0'); }
+function fmtMsInput(ms) {
+  const d = new Date(ms);
+  return d.getFullYear()+'-'+pad2(d.getMonth()+1)+'-'+pad2(d.getDate())+'T'+pad2(d.getHours())+':'+pad2(d.getMinutes());
+}
+function parseMsInput(str) {
+  if (!str) return null;
+  const d = new Date(str);
+  return Number.isFinite(d.getTime()) ? d.getTime() : null;
+}
+function dayStart(ms) {
+  const d = new Date(ms);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+function hasManualOnDay(targetDayStart) {
+  const targetKey = new Date(targetDayStart).toISOString().slice(0,10);
+  return S.some(s => s.recordType==='manual' && (s.dateKey === targetKey || (s.i && dayStart(s.i) === targetDayStart)));
+}
+function sessionOverlapsExisting(newI, newO, excludeId) {
+  return S.some(s => {
+    if (s.id === excludeId) return false;
+    // سجل يدوي بالمدة فقط لا 가진 أوقات، لا يُمكن أن يتداخل.
+    if (s.recordType==='manual' && s.manualDurationOnly) return false;
+    const aStart = s.i, aEnd = s.o === null ? Date.now() : s.o;
+    const bStart = newI, bEnd = newO === null ? Date.now() : newO;
+    return bStart < aEnd && aStart < bEnd;
+  });
+}
+
+/**
+ * أضف سجل يدوي ليوم سابق.
+ * targetDayStart: بداية اليوم بالتوقيت المحلي (ms)
+ * checkInMs, checkOutMs: أوقات محددة أو null
+ * durationMinutes: المدة بالدقائق إذا لم يتم specifying أوقات (المدة فقط، لا تُختلق أوقات)
+ * note: ملاحظات اختيارية
+ * returns { ok, error, session }
+ */
+async function addManualSession(targetDayStart, checkInMs, checkOutMs, durationMinutes, note) {
+  if (!dataReady) return { ok: false, error: 'البيانات غير جاهزة.' };
+  let i, o, manualDurationOnly = false;
+  if (checkInMs !== null && checkOutMs !== null) {
+    i = checkInMs;
+    o = checkOutMs;
+    if (o <= i) return { ok: false, error: 'وقت الانصراف يجب أن يكون بعد وقت الحضور.' };
+  } else if (durationMinutes !== null && durationMinutes > 0) {
+    // مدة فقط: لا نبتكر أوقات حضور أو انصراف، نُخزّن المدة مباشرة.
+    i = null;
+    o = null;
+    manualDurationOnly = true;
+  } else {
+    return { ok: false, error: 'يجب تحديد وقت الحضور والانصراف أو المدة.' };
+  }
+  if (hasManualOnDay(targetDayStart)) {
+    return { ok: false, error: 'يوجد سجل يدوي لهذا اليوم بالفعل. لا يمكن تكرار الإدخال اليدوي ليوم واحد.' };
+  }
+  if (i !== null && o !== null && sessionOverlapsExisting(i, o, null)) {
+    return { ok: false, error: 'هذا السجل يتداخل مع سجل موجود.' };
+  }
+  const now = Date.now();
+  const dayKey = new Date(targetDayStart).toISOString().slice(0,10);
+  const session = { id: now, i, o, recordType: 'manual', manualDurationOnly, durationMinutes: manualDurationOnly ? durationMinutes : null, note: note || null, dateKey };
+  const next = [...S, session];
+  if (await commitData(next)) {
+    toast('تم إضافة السجل اليدوي.');
+    return { ok: true, session };
+  }
+  return { ok: false, error: 'فشل حفظ السجل اليدوي.' };
+}
+
+/**
+ * عدل سجلاً موجوداً.
+ * updates: كائن يحتوي على أي من: i, o, note, manualDurationOnly, durationMinutes, recordType
+ */
+async function editSession(id, updates) {
+  if (!dataReady) return { ok: false, error: 'البيانات غير جاهزة.' };
+  const idx = S.findIndex(s => s.id === id);
+  if (idx === -1) return { ok: false, error: 'السجل غير موجود.' };
+  const next = S.map(s => {
+    if (s.id !== id) return s;
+    return { ...s, ...updates };
+  });
+  const modified = next[idx];
+  // التحقق من صلاحية السجل بعد التعديل
+  if (modified.recordType !== 'manual' && modified.o !== null && modified.o <= modified.i) {
+    return { ok: false, error: 'وقت الانصراف يجب أن يكون بعد وقت الحضور.' };
+  }
+  if (modified.recordType === 'manual' && modified.manualDurationOnly && modified.i !== null) {
+    return { ok: false, error: 'السجل اليدوي بالمدة فقط لا يجب أن يحتوي على أوقات.' };
+  }
+  if (modified.i !== null && modified.o !== null && sessionOverlapsExisting(modified.i, modified.o, id)) {
+    return { ok: false, error: 'التعديل يتسبب في تداخل مع سجل موجود.' };
+  }
+  if (await commitData(next)) {
+    toast('تم تعديل السجل.');
+    return { ok: true };
+  }
+  return { ok: false, error: 'فشل تعديل السجل.' };
+}
+/* ===== End Manual history entry ===== */
 
 async function listBackups() {
   if (!isNative) {
@@ -580,7 +698,30 @@ async function shareLastExport() {
 
 function rows(){
   const out=[];
-  mine().forEach(s=>{const d=new Date(s.i);out.push({'التاريخ':d.toLocaleDateString('ar-EG',{day:'numeric',month:'numeric',year:'numeric'}),'اليوم':d.toLocaleDateString('ar-EG',{weekday:'long'}),'الحضور':tm(s.i),'الانصراف':s.o?tm(s.o):'لم ينصرف','المدة':dur(len(s)),'الساعات':hrs(len(s))});});
+  mine().forEach(s=>{
+    const d=new Date(s.i);
+    const isManual = s.recordType==='manual';
+    const noteText = s.note ? ' — ملاحظة: '+s.note : '';
+    const isDurationOnly = isManual && s.manualDurationOnly;
+    const checkIn = s.i ? tm(s.i) : '—';
+    const checkOut = s.o ? tm(s.o) : '—';
+    const openStatus = s.recordType==='auto' && s.o ? 'تم' : (s.recordType==='auto' ? 'مفتوح' : 'مكتمل');
+    out.push({
+      'التاريخ':d.toLocaleDateString('ar-EG',{day:'numeric',month:'numeric',year:'numeric'}),
+      'اليوم':d.toLocaleDateString('ar-EG',{weekday:'long'}),
+      'الحضور':checkIn,
+      'الانصراف':checkOut,
+      'النوع':isManual?'يدوي':'تلقائي',
+      'المدة':dur(len(s)),
+      'الساعات':hrs(len(s)),
+      'الحالة':openStatus,
+      'ملاحظات':s.note||'',
+      'ملاحظات显示':s.note?'✓':'—',
+      'id':s.id,
+      'recordType':s.recordType,
+      'manualDurationOnly':s.manualDurationOnly||false
+    });
+  });
   return out;
 }
 
@@ -692,7 +833,7 @@ async function commitData(nextData, options = {}) {
   }
 }
 
-$('bin').onclick=async()=>{if(!dataReady||open_())return;const now=Date.now();if(await commitData([...S,{id:now,i:now,o:null}]))toast('تم تسجيل الحضور');};
+$('bin').onclick=async()=>{if(!dataReady||open_())return;const now=Date.now();if(await commitData([...S,{id:now,i:now,o:null,recordType:'auto'}]))toast('تم تسجيل الحضور');};
 $('bout').onclick=async()=>{if(!dataReady)return;const s=open_();if(!s)return;const now=Date.now();const next=S.map(item=>item===s?{...item,o:now}:item);if(await commitData(next))toast('تم تسجيل الانصراف');};
 $('prev').onclick=()=>{cur.setMonth(cur.getMonth()-1);render();};
 $('next').onclick=()=>{cur.setMonth(cur.getMonth()+1);render();};
@@ -707,13 +848,94 @@ $('cancelRestore').onclick=()=>$('restoreModal').classList.remove('on');
 $('confirmRestore').onclick=async()=>{ $('restoreModal').classList.remove('on'); await restoreLatestBackup(); };
 $('syncNow').onclick=async()=>{ await autoSync(); };
 
+let manualEntryInProgress = false;
+$('manualEntry').onclick=async()=>{
+  if (!dataReady) { toast('البيانات غير جاهزة.'); return; }
+  if (manualEntryInProgress) return;
+  manualEntryInProgress = true;
+  const d = new Date();
+  $('manualDate').valueAsDate = d;
+  $('manualMode').value = 'duration';
+  $('manualHours').value = '0';
+  $('manualMinutes').value = '0';
+  $('manualCheckIn').value = '';
+  $('manualCheckOut').value = '';
+  $('manualNote').value = '';
+  $('manualResult').textContent = '';
+  $('manualDurationFields').style.display = 'flex';
+  $('manualTimeFields').style.display = 'none';
+  $('manualEntryModal').classList.add('on');
+};
+$('manualCancel').onclick=()=>{
+  manualEntryInProgress = false;
+  $('manualEntryModal').classList.remove('on');
+  $('manualResult').textContent = '';
+};
+$('manualMode').onchange=()=>{
+  const isDuration = $('manualMode').value === 'duration';
+  $('manualDurationFields').style.display = isDuration ? 'flex' : 'none';
+  $('manualTimeFields').style.display = isDuration ? 'none' : 'flex';
+};
+$('manualConfirm').onclick=async()=>{
+  if (manualEntryInProgress !== true) return;
+  const dateStr = $('manualDate').value;
+  if (!dateStr) { $('manualResult').textContent = 'يرجى اختيار التاريخ.'; return; }
+  const mode = $('manualMode').value;
+  const note = $('manualNote').value || null;
+
+  let checkInMs = null, checkOutMs = null, durationMinutes = null;
+  if (mode === 'duration') {
+    const h = Number($('manualHours').value) || 0;
+    const m = Number($('manualMinutes').value) || 0;
+    durationMinutes = h * 60 + m;
+    if (durationMinutes <= 0) { $('manualResult').textContent = 'المدة يجب أن تكون أكبر من صفر.'; return; }
+  } else {
+    const ci = $('manualCheckIn').value;
+    const co = $('manualCheckOut').value;
+    if (!ci || !co) { $('manualResult').textContent = 'يرجى إدخال وقت الحضور والانصراف.'; return; }
+    checkInMs = new Date(dateStr + 'T' + ci).getTime();
+    checkOutMs = new Date(dateStr + 'T' + co).getTime();
+    if (!Number.isFinite(checkInMs) || !Number.isFinite(checkOutMs)) { $('manualResult').textContent = 'وقت غير صالح.'; return; }
+    if (checkOutMs <= checkInMs) { $('manualResult').textContent = 'وقت الانصراف يجب أن يكون بعد وقت الحضور.'; return; }
+    const targetStart = new Date(dateStr + 'T00:00:00').getTime();
+    if (sessionOverlapsExisting(checkInMs, checkOutMs, null)) { $('manualResult').textContent = 'هذا الوقت يتداخل مع سجل موجود.'; return; }
+  }
+  const targetStart = new Date(dateStr + 'T00:00:00').getTime();
+  if (hasManualOnDay(targetStart)) { $('manualResult').textContent = 'يوجد سجل يدوي لهذا اليوم بالفعل.'; return; }
+
+  manualEntryInProgress = false;
+  const result = await addManualSession(targetStart, checkInMs, checkOutMs, durationMinutes, note);
+  if (result.ok) {
+    $('manualEntryModal').classList.remove('on');
+    $('manualResult').textContent = '';
+    render();
+    setStorageControls();
+    toast('تم إضافة السجل اليدوي.');
+  } else {
+    manualEntryInProgress = true;
+    $('manualResult').textContent = result.error || 'فشل حفظ السجل.';
+  }
+};
+
 setStorageControls();
 
+function firstDateKeyOf(records) {
+  for (let r of records) {
+    if (r.dateKey) return r.dateKey;
+    if (r.i) return dk(r.i);
+  }
+  return null;
+}
+function dateKeyOf(s) {
+  if (s.recordType === 'manual' && s.dateKey) return s.dateKey;
+  if (s.i) return dk(s.i);
+  return null;
+}
 function render(){
   const s=dataReady?open_():null; $('bin').disabled=!dataReady||!!s; $('bout').disabled=!dataReady||!s;
   $('mname').textContent=cur.toLocaleDateString('ar-EG',{month:'long',year:'numeric'});
   const m=dataReady?mine():[],tot=m.reduce((a,x)=>a+len(x),0),dset={};
-  m.forEach(x=>{dset[dk(x.i)]=(dset[dk(x.i)]||0)+len(x);});
+  m.forEach(x=>{const k=dateKeyOf(x);if(k)dset[k]=(dset[k]||0)+len(x);});
   const nd=Object.keys(dset).length;
   $('tot').textContent=dur(tot)+' ('+hrs(tot)+' ساعة)'; $('days').textContent=nd.toLocaleString('ar-EG'); $('avg').textContent=nd?dur(tot/nd):'—';
   const L=$('log');
@@ -729,8 +951,8 @@ function render(){
   }
   if(!m.length){L.innerHTML='<div class="empty">لا توجد حركات في هذا الشهر.<br>اضغط «حضور» لتبدأ.</div>';tick();return;}
   const g={},order=[];
-  m.forEach(x=>{const k=dk(x.i);if(!g[k]){g[k]=[];order.push(k);}g[k].push(x);}); order.reverse();
-  L.innerHTML=order.map(k=>{const a=g[k],d=new Date(a[0].i);return '<div class="day"><div class="dh"><span>'+d.toLocaleDateString('ar-EG',{weekday:'long',day:'numeric',month:'long'})+'</span><em>'+dur(dset[k])+'</em></div>'+a.map(x=>'<div class="se"><span class="t"><u>'+tm(x.i)+'</u> — <s>'+(x.o?tm(x.o):'مستمر')+'</s></span><span class="d">'+dur(len(x))+'</span><button class="del" data-id="'+x.id+'" aria-label="حذف">✕</button></div>').join('')+'</div>';}).join('');
+  m.forEach(x=>{const k=dateKeyOf(x);if(k){if(!g[k]){g[k]=[];order.push(k);}g[k].push(x);}}); order.reverse();
+  L.innerHTML=order.map(k=>{const a=g[k],d=new Date(firstDateKeyOf(a)+'T00:00:00');return '<div class="day"><div class="dh"><span>'+d.toLocaleDateString('ar-EG',{weekday:'long',day:'numeric',month:'long'})+'</span><em>'+dur(dset[k])+'</em></div>'+a.map(x=>'<div class="se"><span class="t"><u>'+tm(x.i)+'</u> — <s>'+(x.o?tm(x.o):'مستمر')+'</s></span><span class="d">'+dur(len(x))+'</span><button class="del" data-id="'+x.id+'" aria-label="حذف">✕</button></div>').join('')+'</div>';}).join('');
   L.querySelectorAll('.del').forEach(b=>b.onclick=async()=>{const id=+b.dataset.id;if(await commitData(S.filter(x=>x.id!==id)))toast('تم حذف الحركة');});
   tick();
 }
@@ -743,8 +965,9 @@ function tick(){
 (async()=>{
   try {
     const loaded = await readData();
-    S = loaded.data;
-    persistedData = cloneData(loaded.data);
+    // V2: ترحيل السجلات القديمة — أضف recordType='auto' للسجلات التي لا تحتوي عليه.
+    S = loaded.data.map(s => ({ ...s, recordType: s.recordType || 'auto' }));
+    persistedData = cloneData(S);
     dataReady = true;
     loadError = null;
     primaryNeedsRecovery = false;
