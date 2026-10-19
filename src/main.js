@@ -2,18 +2,44 @@ import { Capacitor } from '@capacitor/core';
 import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
 import * as XLSX from 'xlsx';
+import { DataSafetyError, backupTimestamp, chooseUnusedName, classifyWriteReadback, createBackupEnvelope, parseBackup, persistSessions, readSessions, shouldTreatMissingAsFirstRun, shouldWriteToMissingPrimary, validateSessions, verifySnapshotReadback } from './data-safety.mjs';
+import { isConfigured, isOnline, pushAllSessions, pullSessions } from './supabase.mjs';
+import { createStoragePaths } from './storage-paths.mjs';
 
-const DATA_PATH = 'SonyTime/data.json';
-const BACKUP_DIR = 'SonyTime/backup';
-const EXPORT_DIR = 'SonyTime/exports';
-const BACKUP_META_KEY = 'sonytime.lastBackupDate';
-const LAST_EXPORT_KEY = 'sonytime.lastExportPath';
+const TEST_BUILD = import.meta.env.VITE_SONYTIME_TEST_BUILD === 'true';
+const {
+  root: STORAGE_ROOT,
+  dataPath: DATA_PATH,
+  backupDir: BACKUP_DIR,
+  recoveryDir: RECOVERY_DIR,
+  exportDir: EXPORT_DIR,
+  shareCacheDir: SHARE_CACHE_DIR,
+  backupDatePath: BACKUP_DATE_PATH,
+  localDataKey: LOCAL_DATA_KEY,
+  backupMetaKey: BACKUP_META_KEY,
+  lastExportKey: LAST_EXPORT_KEY,
+  backupPrefix: BACKUP_PREFIX,
+  safetyPrefix: SAFETY_PREFIX,
+  corruptPrefix: CORRUPT_PREFIX,
+} = createStoragePaths(TEST_BUILD);
 const isNative = Capacitor.getPlatform() !== 'web';
 
 let S = [];
+let persistedData = [];
+let dataReady = false;
+let writeInProgress = false;
+let loadError = null;
+let primaryNeedsRecovery = false;
+let primaryMustBeMissing = false;
+let corruptOriginalRaw = null;
 let cur = new Date();
 cur.setDate(1);
-let lastExportUri = null;
+let lastExportPath = null;
+let lastExportWebUrl = null;
+let safetySequence = 0;
+let syncStatus = 'idle'; // idle | syncing | synced | error
+let lastSyncAt = null;
+let syncError = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -40,64 +66,422 @@ async function nativeRead(path) {
 async function nativeWrite(path, text) {
   await Filesystem.writeFile({ path, directory: Directory.Documents, data: text, encoding: Encoding.UTF8, recursive: true });
 }
-async function exists(path) {
-  try { await Filesystem.stat({ path, directory: Directory.Documents }); return true; } catch { return false; }
+function isMissingFile(error) {
+  const code = String(error?.code ?? '');
+  return ['FILE_NOT_FOUND', 'ENOENT', 'OS-PLUG-FILE-0008'].includes(code) || /(?:file|path).*(?:does not exist|not found)|no such file/i.test(String(error?.message ?? ''));
 }
-async function readData() {
-  if (isNative) {
-    try { return JSON.parse(await nativeRead(DATA_PATH)); } catch { return []; }
+async function nativeExists(path) {
+  try { await Filesystem.stat({ path, directory: Directory.Documents }); return true; }
+  catch (error) { if (isMissingFile(error)) return false; throw error; }
+}
+async function ensureShareCacheDirectory() {
+  try {
+    const info = await Filesystem.stat({ path: SHARE_CACHE_DIR, directory: Directory.Cache });
+    if (info.type !== 'directory') throw new Error('مسار المشاركة المؤقت ليس مجلدًا.');
+  } catch (error) {
+    if (!isMissingFile(error)) throw error;
+    await Filesystem.mkdir({ path: SHARE_CACHE_DIR, directory: Directory.Cache, recursive: true });
   }
-  try { return JSON.parse(localStorage.getItem('sonytime.v1.1') || '[]'); } catch { return []; }
 }
-async function writeData() {
-  const payload = JSON.stringify(S, null, 2);
-  if (isNative) await nativeWrite(DATA_PATH, payload);
-  else localStorage.setItem('sonytime.v1.1', payload);
+function cloneData(value) { return JSON.parse(JSON.stringify(value)); }
+function currentDataStateSignature() {
+  return JSON.stringify({
+    error: loadError?.code ?? null,
+    needsRecovery: primaryNeedsRecovery,
+    mustBeMissing: primaryMustBeMissing,
+    persistedData,
+    corruptOriginalRaw,
+  });
+}
+function fileStamp() { return new Date().toISOString().replace(/[:.]/g, '-'); }
+function uniqueSuffix() {
+  const bytes = new Uint8Array(16);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes);
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+  return `${Date.now()}-${safetySequence++}`;
+}
+
+async function readData() {
+  return readSessions(async () => {
+    if (isNative) {
+      const info = await Filesystem.stat({ path: DATA_PATH, directory: Directory.Documents });
+      if (info.size > 10 * 1024 * 1024) {
+        throw new DataSafetyError('READ_FAILED', 'ملف الحضور أكبر من 10 ميجابايت؛ تم إيقاف القراءة والحفظ لحماية البيانات.');
+      }
+      return nativeRead(DATA_PATH);
+    }
+    const raw = localStorage.getItem(LOCAL_DATA_KEY);
+    if (raw === null) throw Object.assign(new Error('data file missing'), { code: 'FILE_NOT_FOUND' });
+    return raw;
+  });
+}
+
+async function writeSafetySnapshot(raw) {
+  parseBackup(raw);
+  if (isNative) {
+    const path = await chooseUnusedName(
+      () => `${BACKUP_DIR}/safety-${fileStamp()}-${uniqueSuffix()}.json`,
+      nativeExists,
+    );
+    await nativeWrite(path, raw);
+    verifySnapshotReadback(raw, await nativeRead(path));
+  } else {
+    const key = await chooseUnusedName(
+      () => `${SAFETY_PREFIX}${Date.now()}.${uniqueSuffix()}`,
+      async candidate => localStorage.getItem(candidate) !== null,
+    );
+    localStorage.setItem(key, raw);
+    verifySnapshotReadback(raw, localStorage.getItem(key));
+  }
+}
+
+async function writeData(nextData = S, { recover = false, requireMissingPrimary = primaryMustBeMissing } = {}) {
+  if (!dataReady && !recover) throw new Error('البيانات غير جاهزة للكتابة.');
+  const previous = dataReady || ['WRITE_FAILED', 'CORRUPT_DATA', 'READ_FAILED'].includes(loadError?.code) ? persistedData : [];
+  await persistSessions(nextData, previous, {
+    writeSafety: writeSafetySnapshot,
+    writeMain: async raw => {
+      if (requireMissingPrimary) {
+        const currentExists = isNative
+          ? await nativeExists(DATA_PATH)
+          : localStorage.getItem(LOCAL_DATA_KEY) !== null;
+        if (!shouldWriteToMissingPrimary(true, currentExists)) {
+          throw new DataSafetyError('WRITE_FAILED', 'ظهر ملف بيانات جديد؛ تم إيقاف الاستعادة حتى لا يتم استبداله.');
+        }
+      }
+      if (isNative) await nativeWrite(DATA_PATH, raw);
+      else localStorage.setItem(LOCAL_DATA_KEY, raw);
+    },
+    readMain: async () => {
+      if (isNative) return nativeRead(DATA_PATH);
+      const raw = localStorage.getItem(LOCAL_DATA_KEY);
+      if (raw === null) throw new Error('Saved data disappeared during verification');
+      return raw;
+    },
+  });
+  S = cloneData(nextData);
+  persistedData = cloneData(nextData);
+  dataReady = true;
+  loadError = null;
+  primaryNeedsRecovery = false;
+  primaryMustBeMissing = false;
+  corruptOriginalRaw = null;
+  render();
+  setStorageControls();
+  await makeDailyBackup();
 }
 
 async function makeDailyBackup() {
+  if (!dataReady || !S.length || !validateSessions(S).valid) return;
   const key = todayKey();
-  const previous = isNative ? await readNativeMeta() : localStorage.getItem(BACKUP_META_KEY);
-  if (previous === key) return;
   try {
-    const payload = JSON.stringify(S, null, 2);
+    const entries = (await listBackups()).filter(entry => entry.name.startsWith(isNative ? `data-${key}` : `${BACKUP_PREFIX}${key}`));
+    for (const entry of entries) {
+      try {
+        const raw = isNative ? await nativeRead(`${BACKUP_DIR}/${entry.name}`) : localStorage.getItem(entry.key);
+        const existing = parseBackup(raw);
+        if (JSON.stringify(existing.data) === JSON.stringify(S)) {
+          if (isNative) await nativeWrite(BACKUP_DATE_PATH, key);
+          else localStorage.setItem(BACKUP_META_KEY, key);
+          $('storageStatus').textContent = `نسخة اليوم محفوظة — ${key}`;
+          return;
+        }
+      } catch (error) {
+        if (error?.code !== 'INVALID_BACKUP' && error?.code !== 'CORRUPT_DATA') throw error;
+        // Keep invalid and older snapshots untouched.
+      }
+    }
+
     if (isNative) {
-      await nativeWrite(`${BACKUP_DIR}/data-${key}.json`, payload);
-      await nativeWrite('SonyTime/.last_backup_date.txt', key);
+      const path = await chooseUnusedName(
+        () => `${BACKUP_DIR}/data-${key}T${fileStamp()}-${uniqueSuffix()}.json`,
+        nativeExists,
+      );
+      const payload = createBackupEnvelope(S);
+      await nativeWrite(path, payload);
+      verifySnapshotReadback(payload, await nativeRead(path));
+      await nativeWrite(BACKUP_DATE_PATH, key);
     } else {
-      localStorage.setItem('sonytime.backup.'+key, payload);
+      const dailyKey = `${BACKUP_PREFIX}${key}`;
+      const target = await chooseUnusedName(
+        () => `${dailyKey}.${Date.now()}.${uniqueSuffix()}`,
+        async candidate => localStorage.getItem(candidate) !== null,
+      );
+      const payload = createBackupEnvelope(S);
+      localStorage.setItem(target, payload);
+      verifySnapshotReadback(payload, localStorage.getItem(target));
       localStorage.setItem(BACKUP_META_KEY, key);
     }
-    if (isNative) $('storageStatus').textContent = `نسخة اليوم محفوظة تلقائيًا • ${key}`;
-  } catch (e) {
-    $('storageStatus').textContent = 'التخزين المحلي يعمل — تعذر إنشاء نسخة اليوم';
+    $('storageStatus').textContent = `نسخة اليوم محفوظة — ${key}`;
+  } catch {
+    $('storageStatus').textContent = 'تعذّر إنشاء نسخة اليوم؛ بيانات الحضور الأصلية لم تُمس.';
   }
 }
-async function readNativeMeta() { try { return (await nativeRead('SonyTime/.last_backup_date.txt')).trim(); } catch { return null; } }
+
+/* ===== Cloud Sync (Supabase) ===== */
+async function syncToCloud() {
+  if (!isConfigured() || !isOnline() || !dataReady) return { ok: false, skipped: true };
+  syncStatus = 'syncing';
+  render();
+  try {
+    const result = await pushAllSessions(S);
+    if (result.ok) {
+      syncStatus = 'synced';
+      lastSyncAt = new Date();
+      syncError = null;
+    } else {
+      syncStatus = 'error';
+      syncError = result.errors?.join(', ') || 'فشل الرفع للسحابة';
+    }
+    render();
+    return result;
+  } catch (err) {
+    syncStatus = 'error';
+    syncError = err?.message || String(err);
+    render();
+    return { ok: false, error: syncError };
+  }
+}
+
+async function syncFromCloud() {
+  if (!isConfigured() || !isOnline()) return { ok: false, skipped: true };
+  syncStatus = 'syncing';
+  render();
+  try {
+    const result = await pullSessions();
+    if (result.ok && result.sessions.length > 0) {
+      const cloud = result.sessions;
+      const localIds = new Set(S.map(s => s.id));
+      const merged = [...S];
+      let added = 0;
+      for (const c of cloud) {
+        if (!localIds.has(c.id)) {
+          merged.push(c);
+          added += 1;
+        }
+      }
+      if (added > 0) {
+        await commitData(merged);
+      }
+      syncStatus = 'synced';
+      lastSyncAt = new Date();
+      syncError = null;
+    } else {
+      syncStatus = 'synced';
+      lastSyncAt = new Date();
+      syncError = null;
+    }
+    render();
+    return result;
+  } catch (err) {
+    syncStatus = 'error';
+    syncError = err?.message || String(err);
+    render();
+    return { ok: false, error: syncError };
+  }
+}
+
+async function autoSync() {
+  if (!isConfigured() || !isOnline()) return;
+  await syncFromCloud();
+  await syncToCloud();
+}
+/* ===== End Cloud Sync ===== */
 
 async function listBackups() {
   if (!isNative) {
-    return Object.keys(localStorage).filter(k=>k.startsWith('sonytime.backup.')).map(k=>({name:k.replace('sonytime.backup.',''),key:k})).sort((a,b)=>b.name.localeCompare(a.name));
+    return Object.keys(localStorage)
+      .filter(key => key.startsWith(BACKUP_PREFIX) || key.startsWith(SAFETY_PREFIX))
+      .map(key => ({ name: key, key }))
+      .sort((a, b) => Number(a.key.startsWith(SAFETY_PREFIX)) - Number(b.key.startsWith(SAFETY_PREFIX)) || b.name.localeCompare(a.name));
   }
   try {
-    const r = await Filesystem.readdir({ path: BACKUP_DIR, directory: Directory.Documents });
-    return r.files.filter(f=>f.name.endsWith('.json')).sort((a,b)=>b.name.localeCompare(a.name));
-  } catch { return []; }
+    const result = await Filesystem.readdir({ path: BACKUP_DIR, directory: Directory.Documents });
+    return result.files.filter(file => file.name.endsWith('.json')).sort((a, b) => Number(a.name.startsWith('safety-')) - Number(b.name.startsWith('safety-')) || b.name.localeCompare(a.name));
+  } catch (error) {
+    if (isMissingFile(error)) return [];
+    throw error;
+  }
 }
-async function restoreLatestBackup() {
-  const backups = await listBackups();
-  if (!backups.length) { toast('لا توجد نسخة احتياطية بعد'); return; }
+
+async function retryDataRead() {
+  const previousError = loadError;
   try {
-    let raw;
-    if (isNative) raw = await nativeRead(`${BACKUP_DIR}/${backups[0].name}`);
-    else raw = localStorage.getItem(backups[0].key);
-    const restored = JSON.parse(raw);
-    if (!Array.isArray(restored)) throw new Error('invalid');
-    S = restored;
-    await writeData();
+    const loaded = await readData();
+    const missingIsFirstRun = shouldTreatMissingAsFirstRun({
+      primaryNeedsRecovery,
+      previousErrorCode: previousError?.code,
+      knownRecords: persistedData.length,
+    });
+    if (loaded.status === 'missing' && !missingIsFirstRun) {
+      let stillMissing;
+      try {
+        stillMissing = isNative
+          ? !await nativeExists(DATA_PATH)
+          : localStorage.getItem(LOCAL_DATA_KEY) === null;
+      } catch (error) {
+        loadError = new DataSafetyError('READ_FAILED', 'تعذّر تأكيد غياب ملف البيانات؛ لن يتم استبداله.', error);
+        primaryNeedsRecovery = true;
+        primaryMustBeMissing = false;
+        dataReady = false;
+        S = cloneData(persistedData);
+        $('storageStatus').textContent = loadError.message;
+        render();
+        setStorageControls();
+        return false;
+      }
+      if (!stillMissing) {
+        loadError = new DataSafetyError('READ_FAILED', 'ظهر ملف بيانات أثناء محاولة الاستعادة؛ أعد القراءة قبل أي استبدال.');
+        primaryNeedsRecovery = true;
+        primaryMustBeMissing = false;
+        dataReady = false;
+        S = cloneData(persistedData);
+        $('storageStatus').textContent = loadError.message;
+        render();
+        setStorageControls();
+        return false;
+      }
+      primaryNeedsRecovery = true;
+      primaryMustBeMissing = true;
+      dataReady = false;
+      loadError = previousError?.code === 'CORRUPT_DATA'
+        ? previousError
+        : Object.assign(new Error('ملف البيانات غير موجود بعد تعذر التحقق منه؛ يلزم استعادة نسخة سليمة.'), { code: 'WRITE_FAILED' });
+      S = cloneData(persistedData);
+      $('storageStatus').textContent = 'تم تأكيد غياب الملف؛ أوقفنا التعديل العادي ونشترط بقاءه غائبًا لحظة الاستعادة.';
+      render();
+      setStorageControls();
+      return true;
+    }
+    S = loaded.data;
+    persistedData = cloneData(loaded.data);
+    dataReady = true;
+    loadError = null;
+    primaryNeedsRecovery = false;
+    primaryMustBeMissing = loaded.status === 'missing';
+    corruptOriginalRaw = null;
     render();
-    toast(`تم الاسترجاع من ${backups[0].name || backups[0].name}`);
-  } catch { toast('تعذر قراءة النسخة الاحتياطية'); }
+    setStorageControls();
+    return true;
+  } catch (error) {
+    loadError = error;
+    primaryNeedsRecovery = true;
+    primaryMustBeMissing = false;
+    corruptOriginalRaw = error?.code === 'CORRUPT_DATA' ? error.raw ?? null : null;
+    dataReady = false;
+    $('storageStatus').textContent = error?.message || 'تعذّرت إعادة قراءة ملف البيانات.';
+    render();
+    setStorageControls();
+    return error?.code === 'CORRUPT_DATA';
+  }
+}
+
+async function restoreLatestBackup() {
+  if (!await retryDataRead() && !['CORRUPT_DATA', 'WRITE_FAILED'].includes(loadError?.code)) return;
+  try {
+    const candidates = await listBackups();
+    const valid = [];
+    for (const candidate of candidates) {
+      try {
+        const raw = isNative ? await nativeRead(`${BACKUP_DIR}/${candidate.name}`) : localStorage.getItem(candidate.key);
+        const backup = parseBackup(raw);
+        valid.push({
+          name: candidate.name,
+          ...backup,
+          timestamp: backupTimestamp(candidate.name || candidate.key, backup.exportedAt),
+        });
+      } catch { /* Skip invalid backups without changing any stored file. */ }
+    }
+    valid.sort((a, b) => b.timestamp - a.timestamp || b.name.localeCompare(a.name));
+    const selected = valid[0];
+    if (!selected) { toast('لا توجد نسخة احتياطية سليمة للاسترجاع'); return; }
+    let protection;
+    if (corruptOriginalRaw !== null) {
+      protection = `سيتم حفظ الملف التالف الأصلي${persistedData.length ? ` ونسخة أمان من ${persistedData.length} سجل صالح معروف` : ''} قبل الاستبدال`;
+    } else if (persistedData.length > 0) {
+      protection = `سيتم حفظ نسخة أمان من الحالة الحالية (${persistedData.length} سجل)`;
+    } else {
+      protection = 'لا توجد سجلات سابقة معروفة لحفظها';
+    }
+    const stateAtPrompt = currentDataStateSignature();
+    if (!confirm(`النسخة الأحدث تحتوي على ${selected.data.length} سجل. ${protection}. هل تريد المتابعة؟`)) return;
+    if (!await retryDataRead() && !['CORRUPT_DATA', 'WRITE_FAILED'].includes(loadError?.code)) return;
+    if (currentDataStateSignature() !== stateAtPrompt &&
+        !confirm('تغيّرت حالة التخزين بعد التأكيد الأول. سيتم حفظ الحالة السليمة المقروءة أو الملف التالف الأصلي قبل الاستبدال. تأكيد نهائي؟')) return;
+    await preserveCorruptOriginal();
+    if (!await commitData(selected.data, { recover: !dataReady, requireMissingPrimary: primaryMustBeMissing })) return;
+    toast(`تم الاسترجاع من ${selected.name}`);
+  } catch (error) {
+    $('storageStatus').textContent = error?.message || 'تعذّر استرجاع النسخة الاحتياطية.';
+  }
+}
+
+async function preserveCorruptOriginal() {
+  if (corruptOriginalRaw === null) return;
+  if (isNative) {
+    const path = await chooseUnusedName(
+      () => `${RECOVERY_DIR}/data-corrupt-${fileStamp()}-${uniqueSuffix()}.json`,
+      nativeExists,
+    );
+    await nativeWrite(path, corruptOriginalRaw);
+    if (await nativeRead(path) !== corruptOriginalRaw) throw new Error('تعذّر التحقق من حفظ الملف التالف الأصلي.');
+  } else {
+    const key = await chooseUnusedName(
+      () => `${CORRUPT_PREFIX}${Date.now()}.${uniqueSuffix()}`,
+      async candidate => localStorage.getItem(candidate) !== null,
+    );
+    localStorage.setItem(key, corruptOriginalRaw);
+    if (localStorage.getItem(key) !== corruptOriginalRaw) throw new Error('تعذّر حفظ الملف التالف الأصلي.');
+  }
+}
+
+async function readPickedFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ''));
+    reader.onerror = () => reject(new Error('تعذّرت قراءة الملف المختار.'));
+    reader.readAsText(file);
+  });
+}
+
+async function importBackupFile(file) {
+  if (!file || !Number.isFinite(file.size) || file.size > 10 * 1024 * 1024) {
+    $('storageStatus').textContent = 'حجم ملف النسخة يجب ألا يتجاوز 10 ميجابايت.';
+    return;
+  }
+  let imported;
+  try { imported = parseBackup(await readPickedFile(file)); }
+  catch (error) { $('storageStatus').textContent = error?.message || 'النسخة الاحتياطية غير صالحة.'; return; }
+  if (!await retryDataRead() && !['CORRUPT_DATA', 'WRITE_FAILED'].includes(loadError?.code)) {
+    $('storageStatus').textContent = 'تعذّرت قراءة الحالة الحالية؛ لن نكتب فوقها. أعد المحاولة بعد استعادة الوصول إلى التخزين.';
+    return;
+  }
+  if (!dataReady && !['CORRUPT_DATA', 'WRITE_FAILED'].includes(loadError?.code)) {
+    $('storageStatus').textContent = 'تعذّرت قراءة بيانات التطبيق؛ لن أستبدلها قبل التأكد من سلامة التخزين.';
+    return;
+  }
+  let protection;
+  if (corruptOriginalRaw !== null) {
+    protection = `سيتم حفظ الملف التالف الأصلي${persistedData.length ? ` ونسخة أمان من ${persistedData.length} سجل صالح معروف` : ''} قبل الاستبدال`;
+  } else if (persistedData.length > 0) {
+    protection = `سيتم حفظ نسخة أمان من الحالة الحالية (${persistedData.length} سجل)`;
+  } else {
+    protection = 'لا توجد سجلات سابقة معروفة لحفظها';
+  }
+  const stateAtPrompt = currentDataStateSignature();
+  if (!confirm(`تم التحقق من النسخة: ${imported.data.length} سجل. ${protection}. متابعة؟`)) return;
+  if (!await retryDataRead() && !['CORRUPT_DATA', 'WRITE_FAILED'].includes(loadError?.code)) return;
+  if (currentDataStateSignature() !== stateAtPrompt &&
+      !confirm('تغيّرت حالة التخزين بعد التأكيد الأول. سيتم حفظ الحالة السليمة المقروءة أو الملف التالف الأصلي قبل الاستبدال. تأكيد نهائي؟')) return;
+  try {
+    await preserveCorruptOriginal();
+    if (!await commitData(imported.data, { recover: !dataReady, requireMissingPrimary: primaryMustBeMissing })) return;
+    toast('تم التحقق من النسخة واستيرادها بنجاح');
+  } catch (error) {
+    $('storageStatus').textContent = error?.message || 'تعذّر استيراد النسخة؛ لم يتم تأكيد الحفظ.';
+  }
 }
 
 async function exportExcel() {
@@ -117,16 +501,15 @@ async function exportExcel() {
   if (isNative) {
     const path=`${EXPORT_DIR}/${name}`;
     await Filesystem.writeFile({path,directory:Directory.Documents,data:base64,recursive:true});
-    const uri=await Filesystem.getUri({path,directory:Directory.Documents});
-    lastExportUri=uri.uri;
-    localStorage.setItem(LAST_EXPORT_KEY, lastExportUri);
+    lastExportPath = path;
+    localStorage.setItem(LAST_EXPORT_KEY, lastExportPath);
     $('share').disabled=false;
-    toast(`تم حفظ Excel في Documents/SonyTime/exports/${name}`);
+    toast(`تم حفظ Excel في Documents/${STORAGE_ROOT}/exports/${name}`);
   } else {
     const blob=new Blob([bytes],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
     const url=URL.createObjectURL(blob);
     const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url);
-    lastExportUri=url;
+    lastExportWebUrl=url;
     $('share').disabled=false;
     toast(`تم تصدير ${name} محليًا`);
   }
@@ -136,11 +519,63 @@ function bytesToBase64(bytes) {
   for(let i=0;i<bytes.length;i+=chunk) binary+=String.fromCharCode(...bytes.subarray(i,i+chunk));
   return btoa(binary);
 }
+async function exportBackup() {
+  if (!dataReady) { toast('بيانات التطبيق غير جاهزة للتصدير'); return; }
+  const payload = createBackupEnvelope(S);
+  let name = `Sony-time-backup-${todayKey()}-${Date.now()}-${safetySequence++}.json`;
+  if (isNative) {
+    let path = null;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      name = `Sony-time-backup-${todayKey()}-${Date.now()}-${safetySequence++}.json`;
+      const candidate = `${EXPORT_DIR}/${name}`;
+      if (!await nativeExists(candidate)) { path = candidate; break; }
+    }
+    if (!path) throw new Error('تعذّر إنشاء اسم فريد لملف النسخة الاحتياطية.');
+    await nativeWrite(path, payload);
+    parseBackup(await nativeRead(path));
+    const cachePath = `${SHARE_CACHE_DIR}/${name}`;
+    await ensureShareCacheDirectory();
+    await Filesystem.copy({ from: path, to: cachePath, directory: Directory.Documents, toDirectory: Directory.Cache });
+    const uri = await Filesystem.getUri({ path: cachePath, directory: Directory.Cache });
+    try {
+      await Share.share({
+        title: 'نسخة Sony Time الاحتياطية',
+        text: 'اختر Files أو Drive لحفظ النسخة في المكان الذي تريده.',
+        files: [uri.uri],
+        dialogTitle: 'حفظ نسخة Sony Time',
+      });
+      toast('تم فتح قائمة المشاركة لحفظ النسخة');
+    } catch (error) {
+      if (error?.message !== 'Share canceled') $('storageStatus').textContent = `تم إنشاء النسخة داخل Documents/${STORAGE_ROOT}/exports لكن تعذرت مشاركة الملف.`;
+    }
+    return;
+  }
+  const url = URL.createObjectURL(new Blob([payload], { type: 'application/json' }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = name;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast('تم تنزيل النسخة الاحتياطية؛ اختر مكان حفظها من المتصفح');
+}
 async function shareLastExport() {
-  if (!lastExportUri) { toast('صدّر Excel أولًا'); return; }
   try {
-    await Share.share({ title:'Sony time', text:'ملف الحضور والانصراف', files:[lastExportUri], dialogTitle:'مشاركة ملف Excel' });
-  } catch (e) { if (e?.message !== 'Share canceled') toast('تعذر فتح المشاركة'); }
+    let shareUri;
+    if (isNative) {
+      if (!lastExportPath) { toast('صدّر Excel أولًا'); return; }
+      const name = lastExportPath.split('/').pop();
+      const cachePath = `${SHARE_CACHE_DIR}/share-${Date.now()}-${safetySequence++}-${name}`;
+      await ensureShareCacheDirectory();
+      await Filesystem.copy({ from: lastExportPath, to: cachePath, directory: Directory.Documents, toDirectory: Directory.Cache });
+      shareUri = (await Filesystem.getUri({ path: cachePath, directory: Directory.Cache })).uri;
+    } else {
+      if (!lastExportWebUrl) { toast('صدّر Excel أولًا'); return; }
+      shareUri = lastExportWebUrl;
+    }
+    await Share.share({ title:'Sony time', text:'ملف الحضور والانصراف', files:[shareUri], dialogTitle:'مشاركة ملف Excel' });
+  } catch (error) {
+    if (error?.message !== 'Share canceled') toast('تعذر فتح المشاركة');
+  }
 }
 
 function rows(){
@@ -149,41 +584,201 @@ function rows(){
   return out;
 }
 
-$('bin').onclick=async()=>{if(open_())return;S.push({id:Date.now(),i:Date.now(),o:null});await writeData();render();toast('تم تسجيل الحضور');};
-$('bout').onclick=async()=>{const s=open_();if(!s)return;s.o=Date.now();await writeData();render();toast('تم تسجيل الانصراف');};
+function setStorageControls() {
+  const canRecover = ['CORRUPT_DATA', 'WRITE_FAILED', 'READ_FAILED'].includes(loadError?.code);
+  const locked = !dataReady || writeInProgress;
+  $('bin').disabled = locked || !!open_();
+  $('bout').disabled = locked || !open_();
+  $('clr').disabled = locked;
+  $('xl').disabled = locked;
+  $('exportBackup').disabled = locked;
+  $('importBackup').disabled = writeInProgress || (!dataReady && !canRecover);
+  $('restore').disabled = writeInProgress || (!dataReady && !canRecover);
+  // حالة المزامنة مع السحابة
+  const syncBtn = $('syncNow');
+  const syncStatusEl = $('syncStatus');
+  if (syncBtn && syncStatusEl) {
+    if (!isConfigured()) {
+      syncBtn.disabled = true;
+      syncStatusEl.textContent = 'السحابة: غير مضبوط (أضف VITE_SUPABASE_URL و VITE_SUPABASE_ANON_KEY)';
+      syncStatusEl.style.color = '#ffb3ba';
+    } else if (!isOnline()) {
+      syncBtn.disabled = true;
+      syncStatusEl.textContent = 'السحابة: غير متصل بالإنترنت';
+      syncStatusEl.style.color = '#ffd166';
+    } else if (syncStatus === 'syncing') {
+      syncBtn.disabled = true;
+      syncStatusEl.textContent = 'السحابة: جاري المزامنة…';
+      syncStatusEl.style.color = '#bae8e8';
+    } else if (syncStatus === 'synced') {
+      syncBtn.disabled = false;
+      const t = lastSyncAt ? lastSyncAt.toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'}) : '';
+      syncStatusEl.textContent = `السحابة: مزامن${t ? ' آخر مرة في '+t : ''}`;
+      syncStatusEl.style.color = '#baffc9';
+    } else if (syncStatus === 'error') {
+      syncBtn.disabled = false;
+      syncStatusEl.textContent = `السحابة: خطأ — ${syncError || ''}`;
+      syncStatusEl.style.color = '#ffb3ba';
+    } else {
+      syncBtn.disabled = false;
+      syncStatusEl.textContent = 'السحابة: في انتظار المزامنة';
+      syncStatusEl.style.color = '#bae8e8';
+    }
+  }
+}
+
+async function commitData(nextData, options = {}) {
+  if (writeInProgress) return false;
+  writeInProgress = true;
+  setStorageControls();
+  try {
+    await writeData(nextData, options);
+    await syncToCloud();
+    return true;
+  } catch (writeError) {
+    primaryNeedsRecovery = true;
+    primaryMustBeMissing = false;
+    let observed;
+    try {
+      observed = await readData();
+    } catch (readError) {
+      loadError = readError;
+      corruptOriginalRaw = readError?.code === 'CORRUPT_DATA' ? readError.raw ?? null : null;
+      dataReady = false;
+      S = cloneData(persistedData);
+      $('storageStatus').textContent = readError?.message || writeError?.message || 'تعذّر التحقق من حالة ملف البيانات.';
+      render();
+      return false;
+    }
+
+    const readbackState = classifyWriteReadback(observed, nextData, persistedData);
+    if (readbackState === 'missing') {
+      primaryMustBeMissing = true;
+      loadError = writeError;
+      dataReady = false;
+      S = cloneData(persistedData);
+      $('storageStatus').textContent = persistedData.length > 0
+        ? 'ملف البيانات غير موجود بعد فشل الحفظ؛ احتفظنا بآخر سجلات مقروءة وأوقفنا التعديلات حتى الاستعادة.'
+        : 'لم يتم تأكيد الحفظ وملف البيانات غير موجود؛ أوقفنا التعديلات. استعد نسخة سليمة أو استورد نسخة احتياطية.';
+      render();
+      return false;
+    }
+
+    const observedData = observed.data;
+    const matchesAttempt = readbackState === 'attempted';
+    const matchesPrevious = readbackState === 'previous';
+    S = cloneData(observedData);
+    persistedData = cloneData(observedData);
+    if (matchesAttempt || matchesPrevious) {
+      dataReady = true;
+      loadError = null;
+      primaryNeedsRecovery = false;
+      primaryMustBeMissing = false;
+      $('storageStatus').textContent = matchesAttempt
+        ? 'تم حفظ البيانات والتحقق منها بإعادة القراءة.'
+        : 'لم يثبت التعديل؛ تم الإبقاء على آخر نسخة مقروءة سليمة.';
+      render();
+      return matchesAttempt;
+    }
+
+    loadError = writeError;
+    dataReady = false;
+    $('storageStatus').textContent = 'تغيّر ملف البيانات أثناء الحفظ؛ أُوقفت التعديلات حتى استعادة نسخة سليمة.';
+    render();
+    return false;
+  } finally {
+    writeInProgress = false;
+    setStorageControls();
+  }
+}
+
+$('bin').onclick=async()=>{if(!dataReady||open_())return;const now=Date.now();if(await commitData([...S,{id:now,i:now,o:null}]))toast('تم تسجيل الحضور');};
+$('bout').onclick=async()=>{if(!dataReady)return;const s=open_();if(!s)return;const now=Date.now();const next=S.map(item=>item===s?{...item,o:now}:item);if(await commitData(next))toast('تم تسجيل الانصراف');};
 $('prev').onclick=()=>{cur.setMonth(cur.getMonth()-1);render();};
 $('next').onclick=()=>{cur.setMonth(cur.getMonth()+1);render();};
-$('clr').onclick=async()=>{const n=mine().length;if(!n)return;if(confirm('مسح '+n+' سجل من هذا الشهر؟')){const ids=mine().map(s=>s.id);S=S.filter(s=>ids.indexOf(s.id)<0);await writeData();render();toast('تم مسح سجلات الشهر');}};
-$('xl').onclick=()=>exportExcel().catch(()=>toast('تعذر التصدير'));
+$('clr').onclick=async()=>{if(!dataReady)return;const n=mine().length;if(!n)return;if(confirm('مسح '+n+' سجل من هذا الشهر؟')){const ids=mine().map(s=>s.id);if(await commitData(S.filter(x=>!ids.includes(x.id))))toast('تم مسح سجلات الشهر');}};
+$('xl').onclick=()=>exportExcel().catch(error=>$('storageStatus').textContent=error?.message||'تعذر التصدير');
 $('share').onclick=()=>shareLastExport();
+$('exportBackup').onclick=()=>exportBackup().catch(error=>$('storageStatus').textContent=error?.message||'تعذّر تصدير النسخة الاحتياطية.');
+$('importBackup').onclick=()=>$('backupFile').click();
+$('backupFile').onchange=async event=>{const file=event.target.files?.[0];if(file)await importBackupFile(file);event.target.value='';};
 $('restore').onclick=()=>{ $('restoreModal').classList.add('on'); };
 $('cancelRestore').onclick=()=>$('restoreModal').classList.remove('on');
 $('confirmRestore').onclick=async()=>{ $('restoreModal').classList.remove('on'); await restoreLatestBackup(); };
+$('syncNow').onclick=async()=>{ await autoSync(); };
+
+setStorageControls();
 
 function render(){
-  const s=open_(); $('bin').disabled=!!s; $('bout').disabled=!s;
+  const s=dataReady?open_():null; $('bin').disabled=!dataReady||!!s; $('bout').disabled=!dataReady||!s;
   $('mname').textContent=cur.toLocaleDateString('ar-EG',{month:'long',year:'numeric'});
-  const m=mine(),tot=m.reduce((a,x)=>a+len(x),0),dset={};
+  const m=dataReady?mine():[],tot=m.reduce((a,x)=>a+len(x),0),dset={};
   m.forEach(x=>{dset[dk(x.i)]=(dset[dk(x.i)]||0)+len(x);});
   const nd=Object.keys(dset).length;
   $('tot').textContent=dur(tot)+' ('+hrs(tot)+' ساعة)'; $('days').textContent=nd.toLocaleString('ar-EG'); $('avg').textContent=nd?dur(tot/nd):'—';
   const L=$('log');
+  if(!dataReady){
+    const message = loadError?.code === 'CORRUPT_DATA'
+      ? 'ملف البيانات الأصلي لم يتم تغييره. استورد نسخة احتياطية سليمة لاستعادتها.'
+      : loadError?.code === 'WRITE_FAILED'
+        ? 'فشل الحفظ؛ تم إيقاف التعديلات. استرجع نسخة سليمة أو استورد نسخة احتياطية.'
+        : loadError?.code === 'READ_FAILED'
+          ? 'تعذّرت القراءة. ستُعاد محاولة التحقق قبل الاستعادة أو الاستيراد، ولن يُكتب فوق الملف غير المقروء.'
+          : 'تعذّرت قراءة بيانات التطبيق. لم يتم تغيير الملف؛ افحص التخزين ثم أعد فتح التطبيق.';
+    L.innerHTML='<div class="empty">'+message+'</div>';tick();setStorageControls();return;
+  }
   if(!m.length){L.innerHTML='<div class="empty">لا توجد حركات في هذا الشهر.<br>اضغط «حضور» لتبدأ.</div>';tick();return;}
   const g={},order=[];
   m.forEach(x=>{const k=dk(x.i);if(!g[k]){g[k]=[];order.push(k);}g[k].push(x);}); order.reverse();
   L.innerHTML=order.map(k=>{const a=g[k],d=new Date(a[0].i);return '<div class="day"><div class="dh"><span>'+d.toLocaleDateString('ar-EG',{weekday:'long',day:'numeric',month:'long'})+'</span><em>'+dur(dset[k])+'</em></div>'+a.map(x=>'<div class="se"><span class="t"><u>'+tm(x.i)+'</u> — <s>'+(x.o?tm(x.o):'مستمر')+'</s></span><span class="d">'+dur(len(x))+'</span><button class="del" data-id="'+x.id+'" aria-label="حذف">✕</button></div>').join('')+'</div>';}).join('');
-  L.querySelectorAll('.del').forEach(b=>b.onclick=async()=>{const id=+b.dataset.id;S=S.filter(x=>x.id!==id);await writeData();render();toast('تم حذف الحركة');});
+  L.querySelectorAll('.del').forEach(b=>b.onclick=async()=>{const id=+b.dataset.id;if(await commitData(S.filter(x=>x.id!==id)))toast('تم حذف الحركة');});
   tick();
 }
 function tick(){
   const d=new Date();$('clock').textContent=d.toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit',second:'2-digit'});$('date').textContent=d.toLocaleDateString('ar-EG',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
+  if(!dataReady){$('state').className='state off';$('state').textContent='تعذّر تحميل بيانات الحضور';return;}
   const s=open_(); $('state').className='state'+(s?'':' off'); $('state').innerHTML=s?'<b>الحضور مسجل — العمل مستمر</b>':'الحالة: <b>غير مسجل حضور</b>';
 }
 
 (async()=>{
-  S=await readData();
-  const last=localStorage.getItem(LAST_EXPORT_KEY); if(last){lastExportUri=last;$('share').disabled=false;}
-  render();
-  await makeDailyBackup();
+  try {
+    const loaded = await readData();
+    S = loaded.data;
+    persistedData = cloneData(loaded.data);
+    dataReady = true;
+    loadError = null;
+    primaryNeedsRecovery = false;
+    primaryMustBeMissing = loaded.status === 'missing';
+    corruptOriginalRaw = null;
+    let last = null;
+    try { last = localStorage.getItem(LAST_EXPORT_KEY); } catch { /* Export metadata is optional. */ }
+    if (last && isNative && last.startsWith(`${EXPORT_DIR}/`)) { lastExportPath = last; $('share').disabled = false; }
+    setStorageControls();
+    render();
+    await makeDailyBackup();
+    await autoSync();
+  } catch (error) {
+    loadError = error;
+    primaryNeedsRecovery = true;
+    corruptOriginalRaw = error?.code === 'CORRUPT_DATA' ? error.raw ?? null : null;
+    dataReady = false;
+    S = [];
+    persistedData = [];
+    $('storageStatus').textContent = error?.message || 'تعذّرت قراءة بيانات الحضور؛ لم يتم تعديل الملف.';
+    setStorageControls();
+    render();
+    // fallback: جرّب سحب البيانات من السحابة إذا كان المحلي تالفًا أو مفقودًا
+    try {
+      const cloud = await syncFromCloud();
+      if (cloud.ok && cloud.sessions && cloud.sessions.length > 0) {
+        S = cloud.sessions;
+        persistedData = cloneData(cloud.sessions);
+        dataReady = true;
+        loadError = null;
+        $('storageStatus').textContent = `تم استعادة ${cloud.sessions.length} سجل من السحابة.`;
+        render();
+      }
+    } catch { /* Supabase غير مضبوط أو غير متاح؛ يبقى الوضع كما هو. */ }
+  }
   setInterval(tick,1000);
 })();
