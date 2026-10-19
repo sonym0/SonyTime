@@ -66,11 +66,13 @@ body{font-family:CairoLocal,Cairo,system-ui,sans-serif}
 .row3{display:flex;gap:10px;margin:10px 0 14px}.row3 .act{min-width:0}
 .statusline{font-size:12px;color:var(--mu);text-align:center;margin-top:6px;min-height:18px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.58);display:none;align-items:flex-end;justify-content:center;z-index:20;padding:16px}.modal.on{display:flex}.sheet{width:min(520px,100%);background:#0b1324;border:1px solid var(--line);border-radius:22px;padding:18px;box-shadow:0 20px 60px rgba(0,0,0,.55)}.sheet h3{margin:0 0 8px}.sheet p{color:var(--mu);font-size:13px;line-height:1.7}.sheet .row2{margin-bottom:0}
+.test-version{text-align:center;font-size:12px;opacity:.6;padding:2px 0}
 </style>
 </head><body>
 
 <div class="app">
 <header><div class="brand">Sony <i>time</i></div><div class="date" id="date"></div></header>
+<div class='test-version' id='version'>نسخة الاختبار - v1.1.0</div>
 
 <section class="clock">
 <div class="time" id="clock">00:00:00</div>
@@ -108,6 +110,10 @@ body{font-family:CairoLocal,Cairo,system-ui,sans-serif}
 </div>
 <input id="backupFile" type="file" accept=".json,application/json" hidden>
 <div class="statusline" id="storageStatus">جارٍ التحقق من بيانات الحضور…</div>
+<div class="statusline" id="syncStatus" style="font-size:11px;margin-top:4px;">السحابة: غير مضبوط</div>
+<div class="row3">
+  <button class="act" id="syncNow" disabled>مزامنة مع السحابة الآن</button>
+</div>
 
 <div id="log"></div>
 </div>

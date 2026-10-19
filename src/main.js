@@ -3,6 +3,7 @@ import { Directory, Encoding, Filesystem } from '@capacitor/filesystem';
 import { Share } from '@capacitor/share';
 import * as XLSX from 'xlsx';
 import { DataSafetyError, backupTimestamp, chooseUnusedName, classifyWriteReadback, createBackupEnvelope, parseBackup, persistSessions, readSessions, shouldTreatMissingAsFirstRun, shouldWriteToMissingPrimary, validateSessions, verifySnapshotReadback } from './data-safety.mjs';
+import { isConfigured, isOnline, pushAllSessions, pullSessions } from './supabase.mjs';
 import { createStoragePaths } from './storage-paths.mjs';
 
 const TEST_BUILD = import.meta.env.VITE_SONYTIME_TEST_BUILD === 'true';
@@ -36,6 +37,9 @@ cur.setDate(1);
 let lastExportPath = null;
 let lastExportWebUrl = null;
 let safetySequence = 0;
+let syncStatus = 'idle'; // idle | syncing | synced | error
+let lastSyncAt = null;
+let syncError = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -215,6 +219,76 @@ async function makeDailyBackup() {
     $('storageStatus').textContent = 'تعذّر إنشاء نسخة اليوم؛ بيانات الحضور الأصلية لم تُمس.';
   }
 }
+
+/* ===== Cloud Sync (Supabase) ===== */
+async function syncToCloud() {
+  if (!isConfigured() || !isOnline() || !dataReady) return { ok: false, skipped: true };
+  syncStatus = 'syncing';
+  render();
+  try {
+    const result = await pushAllSessions(S);
+    if (result.ok) {
+      syncStatus = 'synced';
+      lastSyncAt = new Date();
+      syncError = null;
+    } else {
+      syncStatus = 'error';
+      syncError = result.errors?.join(', ') || 'فشل الرفع للسحابة';
+    }
+    render();
+    return result;
+  } catch (err) {
+    syncStatus = 'error';
+    syncError = err?.message || String(err);
+    render();
+    return { ok: false, error: syncError };
+  }
+}
+
+async function syncFromCloud() {
+  if (!isConfigured() || !isOnline()) return { ok: false, skipped: true };
+  syncStatus = 'syncing';
+  render();
+  try {
+    const result = await pullSessions();
+    if (result.ok && result.sessions.length > 0) {
+      const cloud = result.sessions;
+      const localIds = new Set(S.map(s => s.id));
+      const merged = [...S];
+      let added = 0;
+      for (const c of cloud) {
+        if (!localIds.has(c.id)) {
+          merged.push(c);
+          added += 1;
+        }
+      }
+      if (added > 0) {
+        await commitData(merged);
+      }
+      syncStatus = 'synced';
+      lastSyncAt = new Date();
+      syncError = null;
+    } else {
+      syncStatus = 'synced';
+      lastSyncAt = new Date();
+      syncError = null;
+    }
+    render();
+    return result;
+  } catch (err) {
+    syncStatus = 'error';
+    syncError = err?.message || String(err);
+    render();
+    return { ok: false, error: syncError };
+  }
+}
+
+async function autoSync() {
+  if (!isConfigured() || !isOnline()) return;
+  await syncFromCloud();
+  await syncToCloud();
+}
+/* ===== End Cloud Sync ===== */
 
 async function listBackups() {
   if (!isNative) {
@@ -520,6 +594,37 @@ function setStorageControls() {
   $('exportBackup').disabled = locked;
   $('importBackup').disabled = writeInProgress || (!dataReady && !canRecover);
   $('restore').disabled = writeInProgress || (!dataReady && !canRecover);
+  // حالة المزامنة مع السحابة
+  const syncBtn = $('syncNow');
+  const syncStatusEl = $('syncStatus');
+  if (syncBtn && syncStatusEl) {
+    if (!isConfigured()) {
+      syncBtn.disabled = true;
+      syncStatusEl.textContent = 'السحابة: غير مضبوط (أضف VITE_SUPABASE_URL و VITE_SUPABASE_ANON_KEY)';
+      syncStatusEl.style.color = '#ffb3ba';
+    } else if (!isOnline()) {
+      syncBtn.disabled = true;
+      syncStatusEl.textContent = 'السحابة: غير متصل بالإنترنت';
+      syncStatusEl.style.color = '#ffd166';
+    } else if (syncStatus === 'syncing') {
+      syncBtn.disabled = true;
+      syncStatusEl.textContent = 'السحابة: جاري المزامنة…';
+      syncStatusEl.style.color = '#bae8e8';
+    } else if (syncStatus === 'synced') {
+      syncBtn.disabled = false;
+      const t = lastSyncAt ? lastSyncAt.toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'}) : '';
+      syncStatusEl.textContent = `السحابة: مزامن${t ? ' آخر مرة في '+t : ''}`;
+      syncStatusEl.style.color = '#baffc9';
+    } else if (syncStatus === 'error') {
+      syncBtn.disabled = false;
+      syncStatusEl.textContent = `السحابة: خطأ — ${syncError || ''}`;
+      syncStatusEl.style.color = '#ffb3ba';
+    } else {
+      syncBtn.disabled = false;
+      syncStatusEl.textContent = 'السحابة: في انتظار المزامنة';
+      syncStatusEl.style.color = '#bae8e8';
+    }
+  }
 }
 
 async function commitData(nextData, options = {}) {
@@ -528,6 +633,7 @@ async function commitData(nextData, options = {}) {
   setStorageControls();
   try {
     await writeData(nextData, options);
+    await syncToCloud();
     return true;
   } catch (writeError) {
     primaryNeedsRecovery = true;
@@ -599,6 +705,8 @@ $('backupFile').onchange=async event=>{const file=event.target.files?.[0];if(fil
 $('restore').onclick=()=>{ $('restoreModal').classList.add('on'); };
 $('cancelRestore').onclick=()=>$('restoreModal').classList.remove('on');
 $('confirmRestore').onclick=async()=>{ $('restoreModal').classList.remove('on'); await restoreLatestBackup(); };
+$('syncNow').onclick=async()=>{ await autoSync(); };
+
 setStorageControls();
 
 function render(){
@@ -648,6 +756,7 @@ function tick(){
     setStorageControls();
     render();
     await makeDailyBackup();
+    await autoSync();
   } catch (error) {
     loadError = error;
     primaryNeedsRecovery = true;
@@ -658,6 +767,18 @@ function tick(){
     $('storageStatus').textContent = error?.message || 'تعذّرت قراءة بيانات الحضور؛ لم يتم تعديل الملف.';
     setStorageControls();
     render();
+    // fallback: جرّب سحب البيانات من السحابة إذا كان المحلي تالفًا أو مفقودًا
+    try {
+      const cloud = await syncFromCloud();
+      if (cloud.ok && cloud.sessions && cloud.sessions.length > 0) {
+        S = cloud.sessions;
+        persistedData = cloneData(cloud.sessions);
+        dataReady = true;
+        loadError = null;
+        $('storageStatus').textContent = `تم استعادة ${cloud.sessions.length} سجل من السحابة.`;
+        render();
+      }
+    } catch { /* Supabase غير مضبوط أو غير متاح؛ يبقى الوضع كما هو. */ }
   }
   setInterval(tick,1000);
 })();

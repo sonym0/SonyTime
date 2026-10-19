@@ -30,3 +30,23 @@ Stack: Capacitor 8.5.2 + Filesystem 8.1.3 + Share 8.0.2 + SheetJS 0.18.5 + Cairo
 
 ## ملاحظة Android Documents
 Capacitor Filesystem يستخدم `Directory.Documents`. على Android 11+ الملفات التي ينشئها التطبيق داخل Documents تكون ضمن نطاق الملفات التي يستطيع التطبيق الوصول إليها. هذا هو السلوك المقصود لهذا التطبيق الشخصي.
+
+## مزامنة السحابة مع Supabase (اختياري)
+- التطبيق يعمل Offline افتراضيًا؛ البيانات تُحفظ محليًا في `Documents/SonyTime/data.json`.
+- إذا ضبطت متغيري البيئة `VITE_SUPABASE_URL` و `VITE_SUPABASE_ANON_KEY` (في `.env` محليًا أو في GitHub Secrets للبناء)، يُرفع كل تغيير إلى جدول `attendance_sessions` على Supabase بعد كل عملية حفظ.
+- عند بدء التشغيل، إذا كان الملف المحلي مفقودًا أو تالفًا، يحاول التطبيق سحب السجلات من Supabase واستعادتها.
+- زر "مزامنة مع السحابة الآن" في شاشة التطبيق يتيح مزامنة فورية يدوية عند وجود إنترنت.
+- لا تُPrint أو تُخزن مفاتيح API داخل الكود المصدري؛ تُقرأ فقط من متغيرات البيئة وقت البناء.
+
+### جدول Supabase المطلوب
+```sql
+create table attendance_sessions (
+  id bigint primary key,
+  i timestamp with time zone not null,
+  o timestamp with time zone,
+  updated_at timestamp with time zone default now()
+);
+alter table attendance_sessions enable row level security;
+-- يمكن وضع سياسات RLS حسب الحاجة (المثال يفتح القراءة/الكتابة للأغراض الشخصية)
+create policy "Allow all" on attendance_sessions for all using (true);
+```
