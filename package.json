@@ -2,6 +2,7 @@
   "name": "sony-time-v2",
   "version": "1.2.0",
   "private": true,
+  "type": "module",
   "description": "Sony time personal offline attendance app",
   "scripts": {
     "build": "npm run prepare-assets && vite build",
