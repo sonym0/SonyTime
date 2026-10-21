@@ -18,29 +18,37 @@ const dkey=ms=>{const d=new Date(ms);return d.getFullYear()+'-'+pad(d.getMonth()
 const open_=()=>S.find(s=>s.o==null);
 const month=()=>S.filter(s=>{const d=new Date(s.i);return d.getFullYear()==cur.getFullYear()&&d.getMonth()==cur.getMonth();});
 function toast(m){const t=$('toast');t.textContent=m;t.classList.add('on');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('on'),2800);}
+const TH=['dark','light','auto'],THI={auto:'◐',dark:'☾',light:'☀'},THN={auto:'تلقائي (حسب الجهاز)',dark:'داكن',light:'فاتح'};
+function applyTheme(){const t=localStorage.getItem('sonytime.theme')||'dark',dk=t==='dark'||(t==='auto'&&matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.dataset.theme=dk?'dark':'light';$('tb').textContent=THI[t];}
+matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change',applyTheme);
 const buzz=()=>navigator.vibrate&&navigator.vibrate(12);
 
-const fsr=p=>Filesystem.readFile({path:p,directory:Directory.Documents,encoding:Encoding.UTF8}).then(r=>typeof r.data==='string'?r.data:'');
-const fsw=(p,t)=>Filesystem.writeFile({path:p,directory:Directory.Documents,data:t,encoding:Encoding.UTF8,recursive:true});
-const missing=e=>/not exist|not found|ENOENT|0008/i.test(String(e?.message||'')+String(e?.code||''));
+const fsr=(p,dir=Directory.Data)=>Filesystem.readFile({path:p,directory:dir,encoding:Encoding.UTF8}).then(r=>typeof r.data==='string'?r.data:'');
+const fsw=(p,t,dir=Directory.Data)=>Filesystem.writeFile({path:p,directory:dir,data:t,encoding:Encoding.UTF8,recursive:true});
+// التخزين الأساسي داخل مساحة التطبيق الخاصة (دايمًا مقروءة/مكتوبة) + نسخة مرآة في localStorage
 async function load(){
-  let raw=null;
-  if(native){try{raw=await fsr(DATA);}catch(e){if(!missing(e)){locked=true;throw e;}}}
-  if(raw==null)raw=localStorage.getItem(LS);
-  if(raw==null)return[];
-  try{return normalize(JSON.parse(raw)).list;}catch(e){locked=true;throw e;}
+  const c=[];
+  if(native)try{c.push(await fsr(DATA));}catch{}
+  const l=localStorage.getItem(LS);if(l!=null)c.push(l);
+  if(!c.length)return[];
+  for(const raw of c)try{return normalize(JSON.parse(raw)).list;}catch{}
+  locked=true;throw new Error('corrupt');
 }
 async function save(msg){
   if(locked){toast('الملف غير مقروء — الحفظ متوقف لحماية بياناتك');return false;}
-  const p=JSON.stringify(S,null,2);
-  try{localStorage.setItem(LS,p);if(native)await fsw(DATA,p);}catch{toast('تعذر الحفظ على التخزين');return false;}
-  render();if(msg)toast(msg);return true;
+  const p=JSON.stringify(S,null,2);let ok=false;
+  try{localStorage.setItem(LS,p);ok=true;}catch{}
+  if(native)try{await fsw(DATA,p);ok=true;}catch{}
+  render();
+  if(!ok){toast('تعذر الحفظ — صدّر نسخة JSON الآن');return false;}
+  if(msg)toast(msg);return true;
 }
 async function snapshot(tag){if(native&&S.length)try{await fsw(`${DIR}/recovery/${tag}-${Date.now()}.json`,JSON.stringify(S,null,2));}catch{}}
 async function backup(manual){
   if(locked||!native)return manual&&toast(native?'الملف غير مقروء':'النسخ الداخلي للتطبيق فقط');
-  const d=new Date(),n=manual?`data-${dkey(d)}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.json`:`data-${dkey(d)}.json`;
-  try{await fsw(`${BK}/${n}`,JSON.stringify(S,null,2));if(manual)toast('تم حفظ نسخة احتياطية');}catch{manual&&toast('تعذر حفظ النسخة');}
+  const d=new Date(),n=manual?`data-${dkey(d)}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}.json`:`data-${dkey(d)}.json`,j=JSON.stringify(S,null,2);
+  try{await fsw(`${BK}/${n}`,j);if(manual)toast('تم حفظ نسخة احتياطية');}catch{manual&&toast('تعذر حفظ النسخة');}
+  fsw(`${BK}/${n}`,j,Directory.Documents).catch(()=>{});
 }
 async function shareFile(name,data,enc){
   if(!native){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([data]));a.download=name;a.click();return;}
@@ -58,7 +66,7 @@ function dataSheet(){sheet(`<h3>إدارة البيانات</h3><p>${S.length} �
 <button class="btn" data-act="expxl">📊 تصدير Excel للشهر الحالي</button>
 <button class="btn del" data-act="clear">🗑 مسح هذا الشهر</button></div>`);}
 async function restoreList(){
-  let files=[];if(native)try{files=(await Filesystem.readdir({path:BK,directory:Directory.Documents})).files.filter(f=>f.name.endsWith('.json')).sort((a,b)=>b.name.localeCompare(a.name));}catch{}
+  let files=[];if(native)try{files=(await Filesystem.readdir({path:BK,directory:Directory.Data})).files.filter(f=>f.name.endsWith('.json')).sort((a,b)=>b.name.localeCompare(a.name));}catch{}
   if(!files.length){toast('لا توجد نسخ داخلية بعد');return;}
   sheet(`<h3>النسخ المتاحة</h3><div class="list">${files.slice(0,15).map(f=>`<button class="btn" data-act="pick" data-n="${f.name}">${f.name.replace(/^data-|\.json$/g,'')}<small>اختيار</small></button>`).join('')}</div>`);
 }
@@ -116,6 +124,7 @@ async function exportXl(){
   await shareFile(name,native?XLSX.write(wb,{type:'base64',bookType:'xlsx'}):XLSX.write(wb,{type:'array',bookType:'xlsx'}),undefined);
 }
 const A={
+  theme:()=>{const t=localStorage.getItem('sonytime.theme')||'dark',n=TH[(TH.indexOf(t)+1)%3];localStorage.setItem('sonytime.theme',n);applyTheme();toast('المظهر: '+THN[n]);},
   toggle:async()=>{buzz();const s=open_();if(s)s.o=Date.now();else S.push({id:Date.now(),i:Date.now(),o:null});await save(s?'تم تسجيل الانصراف':'تم تسجيل الحضور');},
   prev:()=>{cur.setMonth(cur.getMonth()-1);render();},next:()=>{cur.setMonth(cur.getMonth()+1);render();},
   data:dataSheet,add:()=>form(null),close:closeSheet,edit:(e)=>form(S.find(x=>String(x.id)===e.dataset.id)),
@@ -134,6 +143,6 @@ document.addEventListener('click',e=>{
 });
 $('file').addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;try{preview(await f.text(),'الملف: '+f.name);}catch{toast('تعذر قراءة الملف');}});
 (async()=>{
-  try{S=await load();}catch{S=[];toast('ملف البيانات غير مقروء — استورد نسخة سليمة (الحفظ متوقف حتى تستبدله)');}
-  render();backup(false);setInterval(tick,1000);
+  try{S=await load();}catch{S=[];toast('ملف البيانات تالف — استورد نسخة سليمة (الحفظ متوقف حتى تستبدله)');}
+  applyTheme();render();backup(false);setInterval(tick,1000);
 })();
