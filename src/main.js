@@ -849,6 +849,7 @@ $('share').onclick=()=>shareLastExport();
 $('exportBackup').onclick=()=>exportBackup().catch(error=>$('storageStatus').textContent=error?.message||'تعذّر تصدير النسخة الاحتياطية.');
 $('importBackup').onclick=()=>$('backupFile').click();
 $('backupFile').onchange=async event=>{const file=event.target.files?.[0];if(file)await importBackupFile(file);event.target.value='';};
+$('backupNow').onclick=backupNow;
 $('restore').onclick=()=>{ $('restoreModal').classList.add('on'); };
 $('cancelRestore').onclick=()=>$('restoreModal').classList.remove('on');
 $('confirmRestore').onclick=async()=>{ $('restoreModal').classList.remove('on'); await restoreLatestBackup(); };
@@ -924,6 +925,20 @@ $('manualConfirm').onclick=async()=>{
 };
 
 setStorageControls();
+
+async function backupNow() {
+  if (!dataReady || S.length === 0) { toast('لا توجد بيانات للنسخ'); return; }
+  const name = 'data-' + todayKey() + '-' + new Date().toTimeString().slice(0,8).replace(/:/g,'') + '.json';
+  const payload = JSON.stringify(S, null, 2);
+  try {
+    if (isNative) await nativeWrite(`${BACKUP_DIR}/${name}`, payload);
+    else localStorage.setItem('sonytime.backup.' + name.slice(5, -5), payload);
+    toast('تم حفظ نسخة احتياطية');
+  } catch {
+    toast('تعذر حفظ النسخة');
+  }
+}
+$('backupNow')?.addEventListener?.('click', backupNow);
 
 function firstDateKeyOf(records) {
   for (let r of records) {
