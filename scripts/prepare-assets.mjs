@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const fontRoot = path.join(root, 'node_modules', '@fontsource', 'cairo', 'files');
+const fontRoot = path.join(root, 'node_modules', '@fontsource', 'cairo');
 const out = path.join(root, 'public', 'assets', 'fonts');
 fs.mkdirSync(out, { recursive: true });
 
