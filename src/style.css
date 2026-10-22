@@ -44,4 +44,7 @@ header,.month{display:flex;align-items:center;justify-content:space-between}
 .brand{display:flex;align-items:center;gap:10px}.brand img{width:40px;height:40px;border-radius:12px;box-shadow:0 0 18px #b07bff66}.brand b{font-weight:400}
 .greet{font-weight:600;font-size:15px;color:var(--c);margin-bottom:6px;text-shadow:0 1px 10px #000a}
 :root[data-theme=dark] .sub,:root[data-theme=dark] .st span{color:#b9c2dc}
-:root[data-theme=dark] .st,:root[data-theme=dark] .day{backdrop-filter:blur(10px);background:rgba(8,10,22,.55)}
+:root[data-theme=dark] .st,:root[data-theme=dark] .day{backdrop-filter:blur(var(--pblur,10px));background:var(--pbg,rgba(8,10,22,.55))}
+.tabs{display:flex;gap:6px;overflow-x:auto;margin:8px 0 12px;padding-bottom:2px}.tab{flex:none;padding:8px 14px;border-radius:99px;border:1px solid var(--l);background:var(--p);color:var(--m);font:600 13px CairoLocal;cursor:pointer}.tab.on{background:linear-gradient(135deg,#b07bff,#ff6fa8);color:#fff;border:0}
+.swg{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.sw{height:70px;border-radius:16px;border:2px solid var(--l);color:#fff;font:600 13px CairoLocal;cursor:pointer;display:flex;align-items:flex-end;justify-content:center;padding:6px;background:var(--p);transition:.15s}.sw span{background:#0009;padding:2px 9px;border-radius:9px}.sw.on{border-color:#ff7ab8;box-shadow:0 0 0 3px #ff7ab855}.sw:active{transform:scale(.95)}
+input[type=range]{width:100%;accent-color:#ff7ab8;margin-top:8px}
